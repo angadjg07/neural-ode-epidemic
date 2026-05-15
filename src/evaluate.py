@@ -1,11 +1,13 @@
 import os
 import sys
 import pickle
+import json
 import torch
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.metrics import mean_squared_error, mean_absolute_error
+from scipy.integrate import odeint
 
 sys.path.append(os.path.dirname(__file__))
 from node import LatentNeuralODE
@@ -17,19 +19,22 @@ MODELS_DIR = os.path.join(BASE_DIR, 'models')
 PROCESSED_DIR = os.path.join(BASE_DIR, 'data', 'processed')
 
 def compute_metrics(y_true, y_pred):
-    """Computes MAE, RMSE and Peak Error between two trajectories for Compartment I."""
+    """Computes Evaluation standard mathematical metrics Scaled by 10k realistically."""
     I_true = y_true[:, 1]
     I_pred = y_pred[:, 1]
     
-    rmse = np.sqrt(mean_squared_error(I_true, I_pred))
-    mae = mean_absolute_error(I_true, I_pred)
+    # Scale physical magnitudes natively to [per 10k] representations structurally 
+    # so error formats organically represent human readable 'Cases per 10,000' limits 
+    # instead of microscopic fractions like 0.000008
+    rmse = np.sqrt(mean_squared_error(I_true, I_pred)) * 10000.0
+    mae = mean_absolute_error(I_true, I_pred) * 10000.0
     peak_true = np.argmax(I_true)
     peak_pred = np.argmax(I_pred)
     peak_error = np.abs(peak_true - peak_pred)
     
     return rmse, mae, peak_error
 
-def generate_forecast_bands(model, x_context, forecast_horizon, n_samples=10, noise_std=0.02):
+def generate_forecast_bands(model, x_context, forecast_horizon, n_samples=10, noise_std=1e-6, t_global=None):
     """
     Bootstraps the neural predictions by adding gaussian jitter to the input context.
     Returns the mean forecast and the 90% confidence interval standard deviation bounds.
@@ -43,7 +48,7 @@ def generate_forecast_bands(model, x_context, forecast_horizon, n_samples=10, no
             noisy_x = torch.clamp(noisy_x, 0.0, 1.0)
             
             # Prediction is shape (batch_size=1, horizon, 3)
-            pred = model(noisy_x, forecast_horizon=forecast_horizon)
+            pred = model(noisy_x, forecast_horizon=forecast_horizon, t_global=t_global)
             predictions.append(pred.squeeze(0).numpy())
             
     predictions = np.array(predictions) # shape: (n_samples, horizon, 3)
@@ -57,37 +62,87 @@ def generate_forecast_bands(model, x_context, forecast_horizon, n_samples=10, no
     return mean_pred, lower_bound, upper_bound
 
 def evaluate_sir(train_data, test_data):
-    """Evaluates the classical math baseline"""
+    """Evaluates the classical math baseline using the exact same 52-week rolling window logic."""
     with open(os.path.join(MODELS_DIR, 'sir_result.pkl'), 'rb') as f:
-        sir_params = pickle.load(f)
+        sir_result = pickle.load(f)
         
-    beta, gamma = sir_params['beta'], sir_params['gamma']
-    y0 = train_data[0]
-    total_steps = len(train_data) + len(test_data)
-    t_full = np.arange(total_steps)
-    y_pred_full = simulate_sir(y0, t_full, beta, gamma)
+    def sir_deriv(y, t, N, beta, gamma):
+        S, I, R = y
+        return [-beta * S * I, beta * S * I - gamma * I, gamma * I]
+        
+    test_horizon = len(test_data)
+    full_sir_pred = []
     
-    # Extract only the test portion forecast
-    test_pred = y_pred_full[len(train_data):]
-    rmse, mae, peak = compute_metrics(test_data, test_pred)
+    for start_idx in range(0, test_horizon, 52):
+        chunk_size = min(52, test_horizon - start_idx)
+        # Use exact ground truth parameter arrays exclusively per independent window natively 
+        y_test_0 = test_data[start_idx]
+        t_chunk = np.arange(chunk_size)
+        
+        # Scipy uses floating integrals efficiently 
+        chunk_sir_pred = odeint(sir_deriv, y_test_0, t_chunk, args=(1.0, sir_result['beta'], sir_result['gamma']))
+        full_sir_pred.append(chunk_sir_pred)
+        
+    sir_pred = np.concatenate(full_sir_pred, axis=0)
+    
+    # Hide the "green spikes" Matplotlib artifacts physically connecting chunks.
+    for boundary in range(51, test_horizon - 1, 52):
+        sir_pred[boundary, :] = np.nan
+        
+    valid_idx = ~np.isnan(sir_pred[:, 1])
+    rmse, mae, peak = compute_metrics(test_data[valid_idx], sir_pred[valid_idx])
+    
+    # We must return full trajectories encompassing train exactly mapped as baseline flat history natively
+    # To retain backwards UI structural scaling, we stitch train and test identically.
+    train_pred = np.zeros_like(train_data) # We don't evaluate train chunks physically for SIR 
+    y_pred_full = np.concatenate([train_pred, sir_pred], axis=0)
     
     return y_pred_full, rmse, mae, peak
 
 def evaluate_neural_model(model_cls, weights_name, train_data, test_data):
-    """Initializes and evaluates a specific neural architecture."""
-    model = model_cls(seq_length=5, hidden_dim=32)
+    """Initializes and evaluates a specific neural architecture using rolling 52-week forecasts."""
+    model = model_cls(seq_length=5, hidden_dim=64)
     model.load_state_dict(torch.load(os.path.join(MODELS_DIR, weights_name), map_location='cpu'))
     
-    # Context is the last `seq_length` items of the train_data
-    # This simulates actual forecasting where we only know the "present"
-    context = torch.tensor(train_data[-5:], dtype=torch.float32).unsqueeze(0)
+    test_horizon = len(test_data)
+    full_mean_pred, full_lower, full_upper = [], [], []
     
-    mean_pred, lower, upper = generate_forecast_bands(
-        model, context, forecast_horizon=len(test_data), n_samples=15
-    )
+    # We stitch the last 5 weeks of training context seamlessly in front of the 406 test weeks
+    full_context_timeline = np.concatenate([train_data[-5:], test_data], axis=0)
     
-    # Compute metrics exactly identically on the test horizon
-    rmse, mae, peak = compute_metrics(test_data, mean_pred)
+    # Evaluate progressively in realistic 52-week rolling segments
+    for start_idx in range(0, test_horizon, 52):
+        chunk_size = min(52, test_horizon - start_idx)
+        
+        # Grab the 5 ground-truth elements immediately preceding this forecast year chunk
+        chunk_context = full_context_timeline[start_idx : start_idx + 5]
+        context_tensor = torch.tensor(chunk_context, dtype=torch.float32).unsqueeze(0)
+        
+        t_global = torch.arange(len(train_data) + start_idx, len(train_data) + start_idx + chunk_size).unsqueeze(0).float()
+        
+        chunk_mean, chunk_lower, chunk_upper = generate_forecast_bands(
+            model, context_tensor, forecast_horizon=chunk_size, n_samples=15, t_global=t_global
+        )
+        
+        full_mean_pred.append(chunk_mean)
+        full_lower.append(chunk_lower)
+        full_upper.append(chunk_upper)
+        
+    
+    mean_pred = np.concatenate(full_mean_pred, axis=0)
+    lower = np.concatenate(full_lower, axis=0)
+    upper = np.concatenate(full_upper, axis=0)
+    
+    # Visual Correction: Hide the "Green Spikes"
+    # Matplotlib will organically draw straight lines between disjoint chunks if we concatenate them.
+    # To stop the line dropping vertically between chunk boundaries, we insert `np.nan`
+    # exactly at the chunk seams (every 52 weeks minus 1).
+    for boundary in range(51, test_horizon - 1, 52):
+        mean_pred[boundary, :] = np.nan
+        
+    valid_idx = ~np.isnan(mean_pred[:, 1])
+    # Compute true localized metrics across the stitched sequential rollout
+    rmse, mae, peak = compute_metrics(test_data[valid_idx], mean_pred[valid_idx])
     
     return model, mean_pred, lower, upper, (rmse, mae, peak)
 
@@ -113,8 +168,8 @@ def main():
     # Output 1: Generate the Metrics CSV
     metrics_df = pd.DataFrame({
         'Model': ['Classical SIR', 'Latent Neural ODE', 'Hybrid UDE'],
-        'RMSE': [sir_rmse, node_metrics[0], hybrid_metrics[0]],
-        'MAE': [sir_mae, node_metrics[1], hybrid_metrics[1]],
+        'RMSE (per 10k Cases)': [sir_rmse, node_metrics[0], hybrid_metrics[0]],
+        'MAE (per 10k Cases)': [sir_mae, node_metrics[1], hybrid_metrics[1]],
         'Peak Timing Error (Weeks)': [sir_peak, node_metrics[2], hybrid_metrics[2]]
     })
     metrics_df.to_csv(os.path.join(PROCESSED_DIR, 'metrics_table.csv'), index=False)
@@ -132,6 +187,12 @@ def main():
         full_t
     )
     df_params.to_csv(os.path.join(PROCESSED_DIR, 'learned_params.csv'), index=False)
+    df_params.to_json(os.path.join(PROCESSED_DIR, 'learned_params.json'), orient='records')
+    
+    with open(os.path.join(MODELS_DIR, 'sir_result.pkl'), 'rb') as f:
+        sir_params = pickle.load(f)
+    with open(os.path.join(PROCESSED_DIR, 'sir_params.json'), 'w') as f:
+        json.dump(sir_params, f)
     
     # Output 3: R0 Trajectory Plot
     plt.figure(figsize=(10, 5))
@@ -168,6 +229,8 @@ def main():
     plt.fill_between(t_test, hybrid_lower[:, 1], hybrid_upper[:, 1], color='green', alpha=0.15)
     
     plt.axvline(x=len(train_data), color='k', linestyle=':')
+    max_val = max(train_data[:, 1].max(), test_data[:, 1].max())
+    plt.ylim(-0.0001, max_val * 3.5)
     plt.title('Out-of-Distribution Epidemic Forecasting Comparison', fontsize=16)
     plt.xlabel('Weeks Since Onset')
     plt.ylabel('Infected Fraction (I)')

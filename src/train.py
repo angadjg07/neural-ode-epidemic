@@ -44,22 +44,24 @@ class Trainer:
             self.model.train()
             total_train_loss = 0
             
-            for batch in train_loader:
-                batch = batch.to(self.device).float()
+            for batch_x, batch_t in train_loader:
+                batch_x = batch_x.to(self.device).float()
+                batch_t = batch_t.to(self.device).float()
                 
                 # Context is first 5 timesteps, we forecast the remainder to evaluate loss
                 context_length = 5
                 
                 # Protect smaller sets
-                if batch.size(1) <= context_length:
+                if batch_x.size(1) <= context_length:
                     continue
                     
-                x_context = batch[:, :context_length, :]
-                true_y = batch[:, context_length:, :]
+                x_context = batch_x[:, :context_length, :]
+                true_y = batch_x[:, context_length:, :]
+                t_global = batch_t[:, context_length:] # Global indices for the predicted window
                 forecast_horizon = true_y.size(1)
                 
                 self.optimizer.zero_grad()
-                pred_y = self.model(x_context, forecast_horizon=forecast_horizon)
+                pred_y = self.model(x_context, forecast_horizon=forecast_horizon, t_global=t_global)
                 
                 loss = epidemic_loss(pred_y, true_y)
                 if torch.isnan(loss).any():
@@ -81,12 +83,14 @@ class Trainer:
             self.model.eval()
             total_val_loss = 0
             with torch.no_grad():
-                for batch in val_loader:
-                    batch = batch.to(self.device).float()
-                    if batch.size(1) <= context_length: continue
-                    x_context = batch[:, :context_length, :]
-                    true_y = batch[:, context_length:, :]
-                    pred_y = self.model(x_context, forecast_horizon=true_y.size(1))
+                for batch_x, batch_t in val_loader:
+                    batch_x = batch_x.to(self.device).float()
+                    batch_t = batch_t.to(self.device).float()
+                    if batch_x.size(1) <= context_length: continue
+                    x_context = batch_x[:, :context_length, :]
+                    true_y = batch_x[:, context_length:, :]
+                    t_global = batch_t[:, context_length:]
+                    pred_y = self.model(x_context, forecast_horizon=true_y.size(1), t_global=t_global)
                     total_val_loss += epidemic_loss(pred_y, true_y).item()
             
             avg_val_loss = total_val_loss / max(len(val_loader), 1)
@@ -140,19 +144,19 @@ def main():
     train_data = torch.load(os.path.join(PROCESSED_DIR, 'train_data.pt'))
     test_data = torch.load(os.path.join(PROCESSED_DIR, 'test_data.pt'))
     
-    seq_len = 15 # Provide 5 weeks context, 10 weeks prediction
+    seq_len = 45 # Provide 5 weeks context, 40 weeks prediction
     
     train_dataset = EpidemicDataset(train_data, seq_length=seq_len)
-    test_dataset = EpidemicDataset(test_data, seq_length=seq_len)
+    test_dataset = EpidemicDataset(test_data, seq_length=seq_len, start_idx=len(train_data))
     
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
     
     print(f"Initializing {args.model.upper()} model...")
     if args.model == 'latent':
-        model = LatentNeuralODE(seq_length=5, hidden_dim=32)
+        model = LatentNeuralODE(seq_length=5, hidden_dim=64)
     else:
-        model = HybridNeuralODE(seq_length=5, hidden_dim=32)
+        model = HybridNeuralODE(seq_length=5, hidden_dim=64)
         
     trainer = Trainer(model, device, args.epochs, args.run_name)
     trainer.train(train_loader, test_loader)

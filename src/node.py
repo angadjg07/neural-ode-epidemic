@@ -48,58 +48,70 @@ class LatentNeuralODE(nn.Module):
         super(LatentNeuralODE, self).__init__()
         self.seq_length = seq_length
         
-        # Encoder: reads context window
-        self.encoder = nn.GRU(input_size=3, hidden_size=hidden_dim, batch_first=True)
-        # Project hidden state from GRU to initial condition y0 = [S0, I0, R0]
-        self.y0_net = nn.Sequential(
-            nn.Linear(hidden_dim, 3),
-            nn.Softmax(dim=-1) # Hard constraint to keep initial states strictly summing to 1
-        )
+        # We now act as an Observable Neural ODE, removing the encoder and y0_net
+        
+        # ODE Function
         
         # ODE Function
         self.ode_func = ODEFunc(hidden_dim=hidden_dim)
         
-    def forward(self, x, forecast_horizon=None):
+    def forward(self, x, forecast_horizon=None, **kwargs):
         """
         x: (batch_size, seq_length, 3)
         """
         if forecast_horizon is None:
             forecast_horizon = self.seq_length
             
-        # Encode context window
-        _, h_n = self.encoder(x)
-        # h_n shape: (1, batch_size, hidden_dim). Squeeze out the layer dim.
-        h_n = h_n.squeeze(0)
-        
-        # Map to initial condition
-        y0 = self.y0_net(h_n)
+        # Initial condition is identically the last observation in the context window
+        y0 = x[:, -1, :]
         
         # Time steps to integrate over
-        # We start at 0, go up to forecast_horizon
-        t = torch.linspace(0., forecast_horizon - 1, forecast_horizon, device=x.device)
+        # We start at 0, and evaluate up to forecast_horizon + 1 physically
+        # (t=0 evaluates to y0 exactly)
+        t = torch.arange(0., forecast_horizon + 1, device=x.device)
         
         # Integrate via COMPONENT 2 (torchdiffeq wrapper using adjoint method)
-        # odeint output shape: (forecast_horizon, batch_size, 3)
-        pred_y = odeint(self.ode_func, y0, t, method='dopri5')
+        # odeint output shape: (forecast_horizon + 1, batch_size, 3)
+        # Use fixed-step solver to prevent backprop adaptive explosions on Huber
+        pred_y = odeint(self.ode_func, y0, t, method='rk4', options={'step_size': 0.25})
         
-        # Permute to (batch_size, forecast_horizon, 3)
-        pred_y = pred_y.permute(1, 0, 2)
+        # Strip the first prediction (which is just t=0 / y0) and permute
+        pred_y = pred_y[1:].permute(1, 0, 2)
         
         return pred_y
 
 def epidemic_loss(pred_y, true_y):
     """
-    Loss function that combines MSE with soft physical physics constraints.
+    Loss function that combines MSE with soft physical physics constraints (PINN).
     """
-    # Base MSE loss
-    mse = nn.MSELoss()(pred_y, true_y)
+    # Isolate components
+    pred_S, pred_I, pred_R = pred_y[..., 0], pred_y[..., 1], pred_y[..., 2]
+    true_S, true_I, true_R = true_y[..., 0], true_y[..., 1], true_y[..., 2]
     
-    # Soft penalize values outside [0, 1] bounds
-    # Since y0 is sigmoid, violating bounds primarily comes from the ODE integration
+    # We use pure Huber Loss which natively balances gradients inherently
+    loss_fn = nn.HuberLoss() # Replaces MSE; drastically more resilient to noisy outbreak anomalies!
+    
+    # Mathematical Gradient Wake-Up Fix:
+    # Huber/MSE Loss completely vanishes logically generating [0.0] freezing behavior if errors equal 10^-10!
+    # By strictly scaling magnitudes specifically into [0.1..1.0] operating spaces before backprop, gradients actively shift.
+    mse_I = loss_fn(pred_I * 10000.0, true_I * 10000.0)
+    mse_S = loss_fn(pred_S * 10000.0, true_S * 10000.0)
+    mse_R = loss_fn(pred_R * 10000.0, true_R * 10000.0)
+    
+    base_loss = mse_S + mse_I + mse_R
+    
+    # PINN Constraints
+    # 1. Soft penalize values outside [0, 1] bounds
     penalty_upper = torch.relu(pred_y - 1.0).mean()
     penalty_lower = torch.relu(-pred_y).mean()
     
-    return mse + 10.0 * (penalty_upper + penalty_lower)
+    # 2. Physics-Informed Conservation Constraint: S + I + R = 1.0
+    pinn_conservation = torch.abs(pred_y.sum(dim=-1) - 1.0).mean()
+    
+    # We heavily penalize physical violations relative to the boosted loss
+    physics_loss = 100.0 * (penalty_upper + penalty_lower + pinn_conservation)
+    
+    return base_loss + physics_loss
 
 
 def main():

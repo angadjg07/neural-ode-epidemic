@@ -22,23 +22,27 @@ os.makedirs(RAW_DIR, exist_ok=True)
 
 class EpidemicDataset(Dataset):
     """PyTorch Dataset for epidemic sequences."""
-    def __init__(self, data, seq_length=10):
+    def __init__(self, data, seq_length=10, start_idx=0):
         # We store as float tensor
         self.data = torch.tensor(data, dtype=torch.float32)
         self.seq_length = seq_length
+        self.start_idx = start_idx
         self.samples = []
+        self.times = []
         
         # Create sliding window sequences
         for i in range(len(self.data) - self.seq_length):
             # Target is the trajectory of length seq_length
             x = self.data[i:i+self.seq_length]
+            t = torch.arange(self.start_idx + i, self.start_idx + i + self.seq_length, dtype=torch.float32)
             self.samples.append(x)
+            self.times.append(t)
             
     def __len__(self):
         return len(self.samples)
         
     def __getitem__(self, idx):
-        return self.samples[idx]
+        return self.samples[idx], self.times[idx]
 
 def fetch_jhu_covid_data():
     """Downloads Covid data from JHU."""
@@ -111,6 +115,22 @@ def generate_synthetic_sir(N=330_000_000, days=700, beta=1.5, gamma=1.0):
     # Return S, I, R and N
     return S, I, R, N
 
+def fetch_cdc_dengue_data():
+    """Downloads Puerto Rico Dengue data from CDC GitHub."""
+    print("Downloading CDC Dengue Fever data...")
+    url = "https://raw.githubusercontent.com/CDCgov/dengue_epidemic_thresholds/main/data/weekly_data_dengue_epidemic_alert_thresholds_1986_June2024.csv"
+    response = requests.get(url, timeout=10)
+    response.raise_for_status()
+    df = pd.read_csv(io.StringIO(response.text))
+    
+    # Save raw
+    df.to_csv(os.path.join(RAW_DIR, 'cdc_dengue.csv'), index=False)
+    
+    # The dataset has 'conf_cases' column
+    weekly_new = df['conf_cases'].fillna(0).clip(lower=0)
+    
+    return weekly_new.values, 3_200_000
+
 def compute_sir_from_cases(cases, N):
     """
     Given an array of weekly new cases, estimate S, I, R.
@@ -145,13 +165,19 @@ def preprocess_data(S, I, R, N):
 
 def main():
     try:
-        # Prefer empirical JHU COVID data
-        cases, N = fetch_jhu_covid_data()
+        # Prefer empirical CDC Dengue data
+        cases, N = fetch_cdc_dengue_data()
         S, I, R = compute_sir_from_cases(cases, N)
     except Exception as e:
-        print(f"Failed to fetch empirical data: {e}")
-        # Robust synthetic fallback as per instructions
-        S, I, R, N = generate_synthetic_sir()
+        print(f"Failed to fetch empirical Dengue data: {e}")
+        try:
+            # Prefer empirical JHU COVID data
+            cases, N = fetch_jhu_covid_data()
+            S, I, R = compute_sir_from_cases(cases, N)
+        except Exception as e2:
+            print(f"Failed to fetch empirical COVID data: {e2}")
+            # Robust synthetic fallback as per instructions
+            S, I, R, N = generate_synthetic_sir()
 
     # Preprocess safely
     processed_data = preprocess_data(S, I, R, N)
